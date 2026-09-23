@@ -61,6 +61,7 @@ class DesignDecision(BaseModel):
     decision: str
     reasoning: str
     score: float
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class ValidationReport(BaseModel):

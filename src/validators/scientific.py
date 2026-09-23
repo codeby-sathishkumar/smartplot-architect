@@ -39,7 +39,7 @@ class ScientificValidator:
 
         ibc = load_ibc_minimums()
         min_area = float(ibc.get("min_room_area_sqft", 70))
-        undersized = [room.name for room in build_room_layout(request) if room.area < min_area]
+        undersized = [room.name for room in build_room_layout(request, decisions) if room.area < min_area]
         if undersized:
             issues.append("Rooms below IBC minimum area: " + ", ".join(undersized))
 
