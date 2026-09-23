@@ -19,6 +19,38 @@ from src.processors.artifacts import (
 from src.processors.layout import build_room_layout
 
 
+def _wall_thickness_mm(decisions: list[DesignDecision]) -> int:
+    for decision in decisions:
+        if decision.agent != "structural_engineer":
+            continue
+        thickness = decision.details.get("wall_thickness_mm")
+        if isinstance(thickness, (int, float)):
+            return int(thickness)
+        if "mm" in decision.decision:
+            digits = "".join(ch for ch in decision.decision.split("mm", 1)[0] if ch.isdigit())
+            if digits:
+                return int(digits)
+    return 230
+
+
+def _vastu_compliance(request: AnalyzePlotRequest, decisions: list[DesignDecision]) -> int:
+    if not request.requirements.apply_vastu:
+        return 0
+    vastu = next((decision for decision in decisions if decision.agent == "vastu_expert"), None)
+    if vastu is None or not vastu.details.get("applied", True):
+        return 0
+    if vastu.details.get("kitchen_zone", "south-east") == "south-east" and not _kitchen_yielded(vastu):
+        return 92
+    if vastu.details.get("yielded_to_science"):
+        return 70
+    return 80
+
+
+def _kitchen_yielded(decision: DesignDecision) -> bool:
+    zone = str(decision.details.get("kitchen_zone") or "south-east")
+    return zone != "south-east"
+
+
 class DesignProcessor:
     """Converts orchestrated decisions into deliverable files and metadata."""
 
@@ -37,15 +69,10 @@ class DesignProcessor:
         output_dir = self.artifacts_dir / str(design_id)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        rooms = build_room_layout(request)
+        rooms = build_room_layout(request, decisions)
         plot_w = request.plot.dimensions.width
         plot_d = request.plot.dimensions.length
-        wall_thickness = 230
-        for decision in decisions:
-            if decision.agent == "structural_engineer" and "mm" in decision.decision:
-                digits = "".join(ch for ch in decision.decision.split("mm", 1)[0] if ch.isdigit())
-                if digits:
-                    wall_thickness = int(digits)
+        wall_thickness = _wall_thickness_mm(decisions)
 
         write_floor_plan_svg(output_dir / "floor_plan.svg", rooms, plot_w, plot_d)
         write_dxf(output_dir / "floor_plan.dxf", rooms, plot_w, plot_d)
@@ -67,7 +94,7 @@ class DesignProcessor:
             "room_count": len(rooms),
             "optimization_score": round(sum(decision.score for decision in decisions) / max(len(decisions), 1), 2),
             "energy_efficiency": validation.energy_efficiency,
-            "vastu_compliance": 92 if request.requirements.apply_vastu else 0,
+            "vastu_compliance": _vastu_compliance(request, decisions),
             "conditioned_floor_area": bom["floor_area_sqft"],
         }
         write_pdf_report(output_dir / "design_report.pdf", request, decisions, validation, summary)

@@ -1,94 +1,31 @@
-"""LangGraph-based agentic workflow for multi-agent design orchestration."""
+"""LangGraph workflow where specialists review each other during the run."""
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict
+import logging
+from typing import Annotated, NotRequired, TypedDict
 
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from src.agents.site_engineer import calculate_site_access_decision
-from src.agents.construction_builder import generate_construction_builder_output
-from src.agents.structural import calculate_structural_decision
 from src.models.schemas import AnalyzePlotRequest, DesignDecision
-from src.utils.knowledge import load_vastu_rules
+
+logger = logging.getLogger(__name__)
 
 ELEVATION_LOW_THRESHOLD = 150.0
 ELEVATION_MID_THRESHOLD = 600.0
 
-
-# ---------------------------------------------------------------------------
-# Graph state
-# ---------------------------------------------------------------------------
-
-class AgentResult(TypedDict):
-    name: str
-    decision: str
-    reasoning: str
-    score: float
-    weight: float
-
-
-def _append_result(existing: list[AgentResult], new: list[AgentResult]) -> list[AgentResult]:
-    """Reducer that appends new agent results to the accumulated list."""
-    return existing + new
-
-
-class DesignGraphState(TypedDict):
-    """Shared state passed through every node of the design workflow graph."""
-
-    payload: AnalyzePlotRequest
-    environmental: dict
-    agent_results: Annotated[list[AgentResult], _append_result]
-    decisions: list[DesignDecision]
-
-
-# ---------------------------------------------------------------------------
-# Agent node helpers
-# ---------------------------------------------------------------------------
-
-def _make_result(name: str, decision: str, reasoning: str, score: float, weight: float) -> AgentResult:
-    return AgentResult(name=name, decision=decision, reasoning=reasoning, score=score, weight=weight)
-
-
-# ---------------------------------------------------------------------------
-# Agent nodes — each reads from state and appends its AgentResult
-# ---------------------------------------------------------------------------
-
-def architect_node(state: DesignGraphState) -> dict:
-    preferred = state["environmental"]["solar"]["preferred_exposure"]
-    return {
-        "agent_results": [
-            _make_result(
-                "architect",
-                f"Primary living spaces aligned to {preferred}",
-                "Optimized for natural daylight",
-                8.5,
-                1.0,
-            )
-        ]
-    }
-
-
-def meteorologist_node(state: DesignGraphState) -> dict:
-    environmental = state["environmental"]
-    if "wind" not in environmental:
-        raise KeyError("Missing environmental keys for meteorologist: wind")
-    wind = environmental["wind"]
-    if "prevailing_direction" not in wind:
-        raise KeyError("Missing environmental keys for meteorologist: wind.prevailing_direction")
-    direction = wind["prevailing_direction"]
-    return {
-        "agent_results": [
-            _make_result(
-                "meteorologist",
-                f"Cross-ventilation windows oriented towards {direction}",
-                "Uses prevailing wind data",
-                8.2,
-                0.9,
-            )
-        ]
-    }
+# Review pass walks dependencies so later specialists see revised peers.
+REVIEW_ORDER = (
+    "meteorologist",
+    "geologist",
+    "site_engineer",
+    "architect",
+    "vastu_expert",
+    "structural_engineer",
+    "interior_designer",
+    "construction_builder",
+)
 
 
 def geologist_foundation_guidance(elevation: float) -> tuple[str, str]:
@@ -108,141 +45,192 @@ def geologist_foundation_guidance(elevation: float) -> tuple[str, str]:
     )
 
 
-def geologist_node(state: DesignGraphState) -> dict:
-    if "elevation_m" not in state["environmental"]:
-        raise KeyError("Missing environmental keys for geologist: elevation_m")
-    elevation = state["environmental"]["elevation_m"]
-    decision, reasoning = geologist_foundation_guidance(elevation)
+class AgentResultState(TypedDict, total=False):
+    name: str
+    decision: str
+    reasoning: str
+    score: float
+    weight: float
+    details: dict
+
+
+def _append_result(existing: list[AgentResultState] | None, new: list[AgentResultState]) -> list[AgentResultState]:
+    """Reducer that appends new agent results to the accumulated list."""
+    return list(existing or []) + list(new or [])
+
+
+def _merge_brief(existing: dict | None, new: dict | None) -> dict:
+    merged = dict(existing or {})
+    merged.update(new or {})
+    return merged
+
+
+class DesignGraphState(TypedDict):
+    """Shared state passed through every node of the design workflow graph."""
+
+    payload: AnalyzePlotRequest
+    environmental: dict
+    agent_results: Annotated[list[AgentResultState], _append_result]
+    decisions: list[DesignDecision]
+    design_brief: NotRequired[Annotated[dict, _merge_brief]]
+
+
+_AGENTS: dict | None = None
+
+
+def _agents() -> dict:
+    """Lazy import avoids a cycle between this module and the agent classes."""
+    global _AGENTS
+    if _AGENTS is None:
+        from src.agents.orchestrator import (
+            ArchitectAgent,
+            ConstructionBuilderAgent,
+            GeologistAgent,
+            InteriorDesignerAgent,
+            MeteorologistAgent,
+            SiteEngineerAgent,
+            StructuralEngineerAgent,
+            VastuExpertAgent,
+        )
+
+        _AGENTS = {
+            "architect": ArchitectAgent(),
+            "meteorologist": MeteorologistAgent(),
+            "geologist": GeologistAgent(),
+            "structural_engineer": StructuralEngineerAgent(),
+            "site_engineer": SiteEngineerAgent(),
+            "vastu_expert": VastuExpertAgent(),
+            "interior_designer": InteriorDesignerAgent(),
+            "construction_builder": ConstructionBuilderAgent(),
+        }
+    return _AGENTS
+
+
+def _to_agent_result(raw: AgentResultState):
+    from src.agents.orchestrator import AgentResult
+
+    return AgentResult(
+        name=raw["name"],
+        decision=raw["decision"],
+        reasoning=raw["reasoning"],
+        score=raw["score"],
+        weight=raw["weight"],
+        details=dict(raw.get("details") or {}),
+    )
+
+
+def _dump_result(result) -> AgentResultState:
     return {
-        "agent_results": [
-            _make_result(
-                "geologist",
-                decision,
-                reasoning,
-                8.0,
-                0.95,
-            )
-        ]
+        "name": result.name,
+        "decision": result.decision,
+        "reasoning": result.reasoning,
+        "score": result.score,
+        "weight": result.weight,
+        "details": dict(result.details or {}),
     }
+
+
+def _latest_results(state: DesignGraphState) -> dict[str, AgentResultState]:
+    latest: dict[str, AgentResultState] = {}
+    for raw in state.get("agent_results") or []:
+        latest[raw["name"]] = raw
+    return latest
+
+
+def _run_specialist(name: str, state: DesignGraphState) -> dict:
+    peers = [_to_agent_result(raw) for raw in _latest_results(state).values()]
+    result = _agents()[name].run(state["payload"], state["environmental"], peers)
+    dumped = _dump_result(result)
+    logger.info("Specialist %s proposed during the design run", name)
+    return {"agent_results": [dumped], "design_brief": dict(dumped.get("details") or {})}
+
+
+def architect_node(state: DesignGraphState) -> dict:
+    return _run_specialist("architect", state)
+
+
+def meteorologist_node(state: DesignGraphState) -> dict:
+    return _run_specialist("meteorologist", state)
+
+
+def geologist_node(state: DesignGraphState) -> dict:
+    return _run_specialist("geologist", state)
 
 
 def structural_engineer_node(state: DesignGraphState) -> dict:
-    structural = calculate_structural_decision(state["environmental"])
-
-    return {
-        "agent_results": [
-            _make_result(
-                "structural_engineer",
-                f"Load-bearing walls set to {structural.wall_thickness_mm}mm for regional resilience",
-                structural.reasoning,
-                structural.score,
-                1.0,
-            )
-        ]
-    }
+    return _run_specialist("structural_engineer", state)
 
 
 def site_engineer_node(state: DesignGraphState) -> dict:
-    access_plan = calculate_site_access_decision(state["payload"].plot.road_facing)
-    return {
-        "agent_results": [
-            _make_result(
-                "site_engineer",
-                access_plan,
-                "Supports practical site access and safe material movement",
-                7.8,
-                0.85,
-            )
-        ]
-    }
+    return _run_specialist("site_engineer", state)
 
 
 def vastu_expert_node(state: DesignGraphState) -> dict:
-    if not state["payload"].requirements.apply_vastu:
-        return {
-            "agent_results": [
-                _make_result(
-                    "vastu_expert",
-                    "Vastu optional adjustments skipped",
-                    "User disabled vastu preferences",
-                    0.0,
-                    0.7,
-                )
-            ]
-        }
-    return {
-        "agent_results": [
-            _make_result(
-                "vastu_expert",
-                "Kitchen placed in south-east zone",
-                f"Follows tradition-based adjustments where practical ({load_vastu_rules().get('kitchen', 'Prefer south-east placement')})",
-                7.6,
-                0.7,
-            )
-        ]
-    }
+    return _run_specialist("vastu_expert", state)
 
 
 def interior_designer_node(state: DesignGraphState) -> dict:
-    bedrooms = state["payload"].requirements.bedrooms
-    bathrooms = state["payload"].requirements.bathrooms
-    return {
-        "agent_results": [
-            _make_result(
-                "interior_designer",
-                f"Circulation spine optimized for {bedrooms}BR/{bathrooms}BA with comfort zoning",
-                "Reduces travel distance across common spaces and improves day-to-day comfort",
-                8.1,
-                0.75,
-            )
-        ]
-    }
+    return _run_specialist("interior_designer", state)
 
 
 def construction_builder_node(state: DesignGraphState) -> dict:
-    decision, reasoning, score = generate_construction_builder_output(state["payload"], state["environmental"])
+    return _run_specialist("construction_builder", state)
 
-    return {
-        "agent_results": [
-            _make_result(
-                "construction_builder",
-                decision,
-                reasoning,
-                score,
-                0.9,
-            )
+
+def collaborate_node(state: DesignGraphState) -> dict:
+    """Second pass: each specialist revises with the full peer set in view."""
+    latest = _latest_results(state)
+    brief = dict(state.get("design_brief") or {})
+    revisions: list[AgentResultState] = []
+    payload = state["payload"]
+    environmental = state["environmental"]
+    agents = _agents()
+
+    for name in REVIEW_ORDER:
+        if name not in latest:
+            continue
+        others = [
+            _to_agent_result(latest[peer_name])
+            for peer_name in REVIEW_ORDER
+            if peer_name != name and peer_name in latest
         ]
-    }
+        revised = agents[name].revise(payload, environmental, others, brief)
+        if revised is None:
+            continue
+        dumped = _dump_result(revised)
+        latest[name] = dumped
+        revisions.append(dumped)
+        brief.update(dumped.get("details") or {})
+
+    logger.info("Collaboration review updated %s specialist positions", len(revisions))
+    return {"agent_results": revisions, "design_brief": brief}
 
 
 def compile_decisions_node(state: DesignGraphState) -> dict:
-    """Sort accumulated agent results by weighted score and build DesignDecision list."""
+    """Keep the latest position from each specialist and rank by weighted score."""
+    latest = _latest_results(state)
     ordered = sorted(
-        state["agent_results"],
-        key=lambda r: r["score"] * r["weight"],
+        latest.values(),
+        key=lambda result: result["score"] * result["weight"],
         reverse=True,
     )
     decisions = [
         DesignDecision(
-            agent=r["name"],
-            decision=r["decision"],
-            reasoning=r["reasoning"],
-            score=round(r["score"] * r["weight"], 2),
+            agent=result["name"],
+            decision=result["decision"],
+            reasoning=result["reasoning"],
+            score=round(result["score"] * result["weight"], 2),
+            details=dict(result.get("details") or {}),
         )
-        for r in ordered
+        for result in ordered
     ]
     return {"decisions": decisions}
 
-
-# ---------------------------------------------------------------------------
-# Graph construction
-# ---------------------------------------------------------------------------
 
 def build_design_graph() -> CompiledStateGraph:
     """Construct and compile the LangGraph design workflow."""
     workflow = StateGraph(DesignGraphState)
 
-    # Register specialist agent nodes
     workflow.add_node("architect", architect_node)
     workflow.add_node("meteorologist", meteorologist_node)
     workflow.add_node("geologist", geologist_node)
@@ -251,9 +239,10 @@ def build_design_graph() -> CompiledStateGraph:
     workflow.add_node("vastu_expert", vastu_expert_node)
     workflow.add_node("interior_designer", interior_designer_node)
     workflow.add_node("construction_builder", construction_builder_node)
+    workflow.add_node("collaborate", collaborate_node)
     workflow.add_node("compile_decisions", compile_decisions_node)
 
-    # Sequential pipeline: each specialist feeds into the next
+    # Forward pass proposes; collaborate revises with every peer visible; then rank.
     workflow.set_entry_point("architect")
     workflow.add_edge("architect", "meteorologist")
     workflow.add_edge("meteorologist", "geologist")
@@ -262,13 +251,13 @@ def build_design_graph() -> CompiledStateGraph:
     workflow.add_edge("site_engineer", "vastu_expert")
     workflow.add_edge("vastu_expert", "interior_designer")
     workflow.add_edge("interior_designer", "construction_builder")
-    workflow.add_edge("construction_builder", "compile_decisions")
+    workflow.add_edge("construction_builder", "collaborate")
+    workflow.add_edge("collaborate", "compile_decisions")
     workflow.add_edge("compile_decisions", END)
 
     return workflow.compile()
 
 
-# Module-level compiled graph (singleton)
 try:
     design_graph: CompiledStateGraph = build_design_graph()
 except Exception as exc:  # pragma: no cover - defensive initialization guard

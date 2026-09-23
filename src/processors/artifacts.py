@@ -10,6 +10,33 @@ from src.processors.layout import Room
 from src.utils.knowledge import load_ibc_minimums, load_material_specs
 
 
+def _svg_point(plot_d: float, pad: float, scale: float, x: float, y: float) -> tuple[float, float]:
+    return pad + x * scale, pad + (plot_d - y) * scale
+
+
+def _opening_markup(room: Room, plot_d: float, pad: float, scale: float) -> str:
+    parts: list[str] = []
+    for opening in room.openings:
+        if opening.wall == "south":
+            x1, y1 = _svg_point(plot_d, pad, scale, room.x + opening.offset, room.y)
+            x2, y2 = _svg_point(plot_d, pad, scale, room.x + opening.offset + opening.width, room.y)
+        elif opening.wall == "north":
+            x1, y1 = _svg_point(plot_d, pad, scale, room.x + opening.offset, room.y + room.depth)
+            x2, y2 = _svg_point(plot_d, pad, scale, room.x + opening.offset + opening.width, room.y + room.depth)
+        elif opening.wall == "west":
+            x1, y1 = _svg_point(plot_d, pad, scale, room.x, room.y + opening.offset)
+            x2, y2 = _svg_point(plot_d, pad, scale, room.x, room.y + opening.offset + opening.width)
+        else:
+            x1, y1 = _svg_point(plot_d, pad, scale, room.x + room.width, room.y + opening.offset)
+            x2, y2 = _svg_point(plot_d, pad, scale, room.x + room.width, room.y + opening.offset + opening.width)
+        color = "#1d4e89" if opening.kind == "window" else "#b85c38"
+        parts.append(
+            f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
+            f'stroke="{color}" stroke-width="4" stroke-linecap="round"/>'
+        )
+    return "".join(parts)
+
+
 def write_floor_plan_svg(path: Path, rooms: list[Room], plot_w: float, plot_d: float) -> None:
     scale = 12.0
     pad = 40
@@ -28,6 +55,7 @@ def write_floor_plan_svg(path: Path, rooms: list[Room], plot_w: float, plot_d: f
             f'fill="#f7f1e3" stroke="#2c3e50" stroke-width="2"/>'
             f'<text x="{x + w / 2:.1f}" y="{y + d / 2:.1f}" text-anchor="middle" '
             f'dominant-baseline="middle" font-size="11" font-family="sans-serif">{label}</text>'
+            f"{_opening_markup(room, plot_d, pad, scale)}"
         )
     body = "\n".join(svg_rooms)
     svg = (
@@ -67,6 +95,35 @@ def write_dxf(path: Path, rooms: list[Room], plot_w: float, plot_d: float) -> No
     add_rect(0.0, 0.0, plot_w, plot_d)
     for room in rooms:
         add_rect(room.x, room.y, room.width, room.depth)
+        for opening in room.openings:
+            if opening.wall == "south":
+                x1, y1 = room.x + opening.offset, room.y
+                x2, y2 = x1 + opening.width, room.y
+            elif opening.wall == "north":
+                x1, y1 = room.x + opening.offset, room.y + room.depth
+                x2, y2 = x1 + opening.width, room.y + room.depth
+            elif opening.wall == "west":
+                x1, y1 = room.x, room.y + opening.offset
+                x2, y2 = room.x, y1 + opening.width
+            else:
+                x1, y1 = room.x + room.width, room.y + opening.offset
+                x2, y2 = room.x + room.width, y1 + opening.width
+            lines.extend(
+                [
+                    "0",
+                    "LINE",
+                    "8",
+                    "OPENINGS",
+                    "10",
+                    f"{x1:.3f}",
+                    "20",
+                    f"{y1:.3f}",
+                    "11",
+                    f"{x2:.3f}",
+                    "21",
+                    f"{y2:.3f}",
+                ]
+            )
     lines.extend(["0", "ENDSEC", "0", "EOF"])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -141,10 +198,14 @@ def write_bom(path: Path, rooms: list[Room], wall_thickness_mm: int) -> dict:
     ibc = load_ibc_minimums()
     floor_area = round(sum(room.area for room in rooms), 2)
     wall_length = round(sum(2 * (room.width + room.depth) for room in rooms), 2)
+    window_count = sum(1 for room in rooms for opening in room.openings if opening.kind == "window")
+    door_count = sum(1 for room in rooms for opening in room.openings if opening.kind == "door")
     bom = {
         "floor_area_sqft": floor_area,
         "estimated_wall_length_ft": wall_length,
         "wall_thickness_mm": wall_thickness_mm,
+        "window_count": window_count,
+        "door_count": door_count,
         "ibc_minimums": ibc,
         "materials": [
             {
@@ -180,6 +241,8 @@ def write_pdf_report(
     ]
     for decision in decisions:
         lines.append(f"- {decision.agent}: {decision.decision} ({decision.reasoning})")
+        if decision.details.get("yielded_to_science"):
+            lines.append("  conflict resolved toward the higher-weight scientific guidance")
     if validation.issues:
         lines.append("")
         lines.append("Issues: " + "; ".join(validation.issues))
